@@ -2,3 +2,5 @@ calibration
 dataset
 dataset_card.json
 tracking_eval
+.venv
+metrics.csv
