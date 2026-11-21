@@ -4,3 +4,8 @@ dataset_card.json
 tracking_eval
 .venv
 metrics.csv
+*.onnx
+*.pth
+*.ckpt
+*.egg-info/
+__pycache__/
