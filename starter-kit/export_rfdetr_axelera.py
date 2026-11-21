@@ -9,8 +9,80 @@ from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
+import torch
 from PIL import Image
 from rfdetr import RFDETRMedium, RFDETRNano, RFDETRSmall
+
+
+class _RFDETRHostDecoder(torch.nn.Module):
+    """Host-side RF-DETR transformer decoder + box/class heads taking Metis backbone features."""
+
+    def __init__(self, lwdetr: torch.nn.Module, pos_embed: torch.Tensor) -> None:
+        super().__init__()
+        self.transformer = lwdetr.transformer
+        self.refpoint_embed = lwdetr.refpoint_embed
+        self.query_feat = lwdetr.query_feat
+        self.bbox_embed = lwdetr.bbox_embed
+        self.class_embed = lwdetr.class_embed
+        self.num_queries = lwdetr.num_queries
+        self.bbox_reparam = lwdetr.bbox_reparam
+        self.register_buffer("pos_embed", pos_embed.detach().clone())
+
+    def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        refpoint_embed_weight = self.refpoint_embed.weight[: self.num_queries]
+        query_feat_weight = self.query_feat.weight[: self.num_queries]
+        hs, ref_unsigmoid, hs_enc, ref_enc = self.transformer(
+            [features],
+            None,
+            [self.pos_embed],
+            refpoint_embed_weight,
+            query_feat_weight,
+            cross_attn_srcs=None,
+        )[:4]
+        if hs is not None:
+            if self.bbox_reparam:
+                delta = self.bbox_embed(hs)
+                cxcy = delta[..., :2] * ref_unsigmoid[..., 2:] + ref_unsigmoid[..., :2]
+                wh = delta[..., 2:].exp() * ref_unsigmoid[..., 2:]
+                outputs_coord = torch.cat([cxcy, wh], dim=-1)
+            else:
+                outputs_coord = (self.bbox_embed(hs) + ref_unsigmoid).sigmoid()
+            outputs_class = self.class_embed(hs)
+        else:
+            outputs_class = self.transformer.enc_out_class_embed[0](hs_enc)
+            outputs_coord = ref_enc
+        return outputs_coord, outputs_class
+
+
+def export_host_decoder(
+    model: object, output_dir: Path, size: int
+) -> tuple[Path, list[int]]:
+    """Export the host-side decoder ONNX matching ``backbone/inference_model.onnx``."""
+    import copy
+
+    lw = copy.deepcopy(model.model.model).eval().cpu()  # type: ignore[attr-defined]
+    lw.export()
+    dummy_img = torch.zeros(1, 3, size, size, dtype=torch.float32)
+    with torch.no_grad():
+        srcs, _, poss, _ = lw.backbone(dummy_img)
+    feat_sample = srcs[0]
+    pos_sample = poss[0]
+    host_dec = _RFDETRHostDecoder(lw, pos_sample).eval().cpu()
+
+    dec_dir = output_dir / "host_decoder"
+    dec_dir.mkdir(parents=True, exist_ok=True)
+    dec_path = dec_dir / "inference_model.onnx"
+    torch.onnx.export(
+        host_dec,
+        (feat_sample,),
+        str(dec_path),
+        input_names=["features"],
+        output_names=["dets", "labels"],
+        opset_version=17,
+        do_constant_folding=True,
+        dynamo=False,
+    )
+    return dec_path, list(feat_sample.shape)
 
 MODELS = {
     "nano": (RFDETRNano, 384),
@@ -174,6 +246,8 @@ def main() -> None:
         if bb_path.resolve() != canonical_bb.resolve():
             shutil.copyfile(bb_path, canonical_bb)
         exported["backbone"] = canonical_bb
+        dec_path, _ = export_host_decoder(model, args.output_dir, size)
+        exported["host_decoder"] = dec_path
 
     reports: dict[str, dict[str, object]] = {}
     if args.sample_image is not None:
@@ -182,6 +256,8 @@ def main() -> None:
                 f"--sample-image does not exist: {args.sample_image}"
             )
         for mode_name, onnx_path in exported.items():
+            if mode_name == "host_decoder":
+                continue
             reports[mode_name] = verify_onnx_outputs(
                 onnx_path,
                 args.sample_image,
@@ -189,6 +265,32 @@ def main() -> None:
                 backbone_only=(mode_name == "backbone"),
                 num_classes=num_classes,
             )
+        if "backbone" in exported and "host_decoder" in exported:
+            inp = preprocess_image(args.sample_image, size)
+            bb_sess = ort.InferenceSession(str(exported["backbone"]), providers=["CPUExecutionProvider"])
+            dec_sess = ort.InferenceSession(str(exported["host_decoder"]), providers=["CPUExecutionProvider"])
+            bb_in = bb_sess.get_inputs()[0].name
+            bb_out = bb_sess.get_outputs()[0].name
+            feats = bb_sess.run([bb_out], {bb_in: inp})[0]
+            dec_in = dec_sess.get_inputs()[0].name
+            dec_names = [o.name for o in dec_sess.get_outputs()]
+            dec_outs = dict(zip(dec_names, dec_sess.run(dec_names, {dec_in: feats}), strict=True))
+            split_rep: dict[str, object] = {
+                "backbone_out_shape": list(feats.shape),
+                "decoder_outputs": {k: list(v.shape) for k, v in dec_outs.items()},
+            }
+            if "full" in exported:
+                f_sess = ort.InferenceSession(str(exported["full"]), providers=["CPUExecutionProvider"])
+                f_in = f_sess.get_inputs()[0].name
+                f_names = [o.name for o in f_sess.get_outputs()]
+                f_outs = dict(zip(f_names, f_sess.run(f_names, {f_in: inp}), strict=True))
+                split_rep["max_abs_diff_dets"] = round(
+                    float(np.max(np.abs(dec_outs["dets"] - f_outs["dets"]))), 6
+                )
+                split_rep["max_abs_diff_labels"] = round(
+                    float(np.max(np.abs(dec_outs["labels"] - f_outs["labels"]))), 6
+                )
+            reports["split_backbone_plus_host_decoder"] = split_rep
 
     print(
         json.dumps(

@@ -23,8 +23,32 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from filterpy.kalman import KalmanFilter
 from scipy.optimize import linear_sum_assignment
+
+
+class _SimpleKalmanFilter:
+    """Drop-in pure-NumPy replacement for ``filterpy.kalman.KalmanFilter``."""
+
+    def __init__(self, dim_x: int, dim_z: int) -> None:
+        self.x = np.zeros((dim_x, 1), dtype=np.float64)
+        self.P = np.eye(dim_x, dtype=np.float64)
+        self.F = np.eye(dim_x, dtype=np.float64)
+        self.H = np.zeros((dim_z, dim_x), dtype=np.float64)
+        self.Q = np.eye(dim_x, dtype=np.float64)
+        self.R = np.eye(dim_z, dtype=np.float64)
+        self._I = np.eye(dim_x, dtype=np.float64)
+
+    def predict(self) -> None:
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+
+    def update(self, z: np.ndarray) -> None:
+        z_col = np.asarray(z, dtype=np.float64).reshape(-1, 1)
+        y = z_col - self.H @ self.x
+        S = self.H @ self.P @ self.H.T + self.R
+        K = np.linalg.solve(S, self.H @ self.P).T
+        self.x = self.x + K @ y
+        self.P = (self._I - K @ self.H) @ self.P
 
 # Une détection = (class_id 0-based, score, [x, y, w, h])
 # C'est exactement le format produit par _nms_dets() dans predict_onnx_baseline.py
@@ -126,7 +150,7 @@ class KalmanBoxTracker:
         self.id = track_id
 
         # --- 3a. Création du filtre : 8 valeurs d'état, 4 valeurs mesurées ---
-        self.kf = KalmanFilter(dim_x=8, dim_z=4)
+        self.kf = _SimpleKalmanFilter(dim_x=8, dim_z=4)
 
         # F (transition) : modèle "vitesse constante"
         #   nouvelle_position = position + vitesse   (dt = 1 image)

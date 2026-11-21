@@ -1,5 +1,6 @@
 calibration
 dataset
+dataset_aug
 dataset_card.json
 tracking_eval
 
@@ -7,7 +8,12 @@ tracking_eval
 __pycache__/
 *.egg-info/
 .venv/
+*.onnx
+*.pth
+*.ckpt
 starter-kit/runs/
 starter-kit/exports/
 starter-kit/pred_mot*/
 starter-kit/*preds*.json
+Kalman/runs/
+
