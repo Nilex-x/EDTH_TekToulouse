@@ -2,3 +2,12 @@ calibration
 dataset
 dataset_card.json
 tracking_eval
+
+# Generated artifacts (training, exports, predictions, Python build)
+__pycache__/
+*.egg-info/
+.venv/
+starter-kit/runs/
+starter-kit/exports/
+starter-kit/pred_mot*/
+starter-kit/*preds*.json

@@ -15,6 +15,8 @@ Judging (proposed): detection 40% (`mAP@50:95`, `small_AP@50`), tracking 40% (`M
 - `calibration/`: 200 train-only 384x384 JPEGs for INT8 quantization.
 - `tracking_eval/seq_0001..0008/video.mp4` (30 fps). Only `seq_0001–0004` (split `valid`) have `gt/gt.txt`; split membership, resolution and frame counts come from `tracking_eval/sequences_manifest.json`.
 
+Generated artifacts are gitignored too and must never be committed: `starter-kit/runs/` (checkpoints, >100 MB each), `starter-kit/exports/` (ONNX), `starter-kit/pred_mot*/` and `starter-kit/*preds*.json` (predictions), `.venv/`, `__pycache__/`, `*.egg-info/`. Write new outputs under these names/paths so they stay ignored.
+
 ## Commands
 
 All pipeline commands run from `starter-kit/` (Python ≥ 3.11, `ffmpeg` on PATH for MOT). Setup: `uv venv && source .venv/bin/activate && uv pip install -e .` — or prefix commands with `uv run --with "rfdetr[onnx,train]" --with onnx --with onnxscript --with onnxruntime --with scipy`.
