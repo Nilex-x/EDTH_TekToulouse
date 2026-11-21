@@ -54,7 +54,11 @@ from track_roi import (
     _match,
     _near_existing_track,
     _nms_small_aware,
+    _recover_occluded,
     crop_regions,
+    select_discover_tiles,
+    tile_regions,
+    warp_box_cmc,
 )
 
 CLASS_NAMES = ("drone_air", "airplane", "helicopter")
@@ -128,6 +132,10 @@ class OnlineTracker:
         self.tracks: list[Track] = []
         self.next_tid = 1
         self.frame_idx = 0
+        self._discover_cursor = 0
+        self._discover_tiles: list[Region] = []
+        self._discover_dims: tuple[int, int] | None = None
+        self._discover_cooldown: dict[int, int] = {}
 
     def step(
         self, bgr: np.ndarray
@@ -140,7 +148,9 @@ class OnlineTracker:
         for t in self.tracks:
             if M is not None:
                 t.kf.apply_cmc(M)
-            t.kf.predict()
+                if t.cmc_last_box:
+                    t.cmc_last_box = warp_box_cmc(t.cmc_last_box, M)
+            t.kf.predict(coasting=(t.misses > 0), vel_damping=self.cfg.vel_damping)
 
         dets = self.detector.detect(
             rgb, None, top_k=self.cfg.top_k, score_thr=self.cfg.low_thr
@@ -158,6 +168,74 @@ class OnlineTracker:
                         dets.append((cid, s, b))
                 n_pass += 1
 
+        if self.cfg.use_discover:
+            has_visible = any(
+                t.confirmed and t.avg_score >= self.cfg.out_score_thr for t in self.tracks
+            )
+            budget = (
+                self.cfg.discover_budget_tracking
+                if has_visible
+                else self.cfg.discover_budget_idle
+            )
+            if budget > 0:
+                if self._discover_dims != (w_px, h_px):
+                    self._discover_dims = (w_px, h_px)
+                    self._discover_tiles = tile_regions(
+                        w_px, h_px, self.cfg.discover_tile_side, self.cfg.discover_overlap
+                    )
+                    self._discover_cursor = 0
+                    self._discover_cooldown.clear()
+                chosen_tiles, self._discover_cursor = select_discover_tiles(
+                    self._discover_tiles,
+                    self.cmc.motion_map if self.cmc is not None else None,
+                    self.cmc.downscale if self.cmc is not None else 0.5,
+                    self._discover_cursor,
+                    budget,
+                    self._discover_cooldown,
+                    self.frame_idx,
+                    use_motion=self.cfg.discover_motion_priority,
+                )
+                micro_cand: tuple[float, list[float]] | None = None
+                for region in chosen_tiles:
+                    _, _, side = region
+                    for cid, s, b in self.detector.detect(
+                        rgb,
+                        region,
+                        top_k=self.cfg.discover_top_k,
+                        score_thr=self.cfg.discover_score_thr * 0.75
+                        if self.cfg.discover_micro_zoom > 0
+                        else self.cfg.discover_score_thr,
+                    ):
+                        if b[2] >= 0.85 * side or b[3] >= 0.85 * side:
+                            continue
+                        if s >= self.cfg.discover_score_thr:
+                            dets.append((cid, s, b))
+                        if (
+                            self.cfg.discover_micro_zoom > 0
+                            and self.cfg.discover_micro_zoom < side
+                            and max(b[2], b[3]) <= 24.0
+                            and s < self.cfg.high_thr
+                            and (micro_cand is None or s > micro_cand[0])
+                        ):
+                            micro_cand = (s, b)
+                    n_pass += 1
+                if micro_cand is not None:
+                    _, mb = micro_cand
+                    mside = max(1, min(self.cfg.discover_micro_zoom, w_px, h_px))
+                    mcx, mcy = mb[0] + mb[2] / 2.0, mb[1] + mb[3] / 2.0
+                    mx0 = int(np.clip(round(mcx - mside / 2.0), 0, w_px - mside))
+                    my0 = int(np.clip(round(mcy - mside / 2.0), 0, h_px - mside))
+                    regions.append((mx0, my0, mside))
+                    for cid, s, b in self.detector.detect(
+                        rgb,
+                        (mx0, my0, mside),
+                        top_k=self.cfg.crop_top_k,
+                        score_thr=self.cfg.crop_score_thr,
+                    ):
+                        if b[2] < 0.85 * mside and b[3] < 0.85 * mside:
+                            dets.append((cid, s, b))
+                    n_pass += 1
+
         dets = _nms_small_aware(dets, iou_thr=self.cfg.nms_iou)
         high = [d for d in dets if d[1] >= self.cfg.high_thr]
         low = [d for d in dets if d[1] < self.cfg.high_thr]
@@ -166,11 +244,24 @@ class OnlineTracker:
         rest_tracks = [self.tracks[i] for i in rest_t]
         m2, rest_t2, _ = _match(rest_tracks, low, self.cfg)
 
+        occ_tracks = [rest_tracks[i] for i in rest_t2]
+        unmatched_high_dets = [high[j] for j in rest_high]
+        m3, rest_t3, rest_high_idx = _recover_occluded(
+            occ_tracks, unmatched_high_dets, self.cfg
+        )
+        rest_high = [rest_high[j] for j in rest_high_idx]
+
         active_out: list[tuple[int, int, float, list[float]]] = []
-        for trk, (cid, score, box) in [(self.tracks[i], high[j]) for i, j in m1] + [
-            (rest_tracks[i], low[j]) for i, j in m2
-        ]:
-            trk.kf.update(box)
+        updates: list[tuple[Track, Det, bool]] = [(self.tracks[i], high[j], False) for i, j in m1]
+        updates += [(rest_tracks[i], low[j], False) for i, j in m2]
+        updates += [(occ_tracks[i], unmatched_high_dets[j], True) for i, j in m3]
+
+        for trk, (cid, score, box), recovered in updates:
+            gap_dt = self.frame_idx - trk.last_det_frame if trk.last_det_frame > 0 else 1
+            if recovered or trk.misses >= 2:
+                trk.kf.reanchor(box, dt=gap_dt, prev_cmc_box=trk.cmc_last_box)
+            else:
+                trk.kf.update(box)
             trk.cls, trk.score = cid, score
             trk.class_votes[cid] += score
             trk.avg_score += self.cfg.score_ema * (score - trk.avg_score)
@@ -178,6 +269,7 @@ class OnlineTracker:
             trk.misses = 0
             trk.last_det_frame = self.frame_idx
             trk.last_det_box = list(box)
+            trk.cmc_last_box = list(box)
             if not trk.confirmed and trk.hits >= self.cfg.min_hits:
                 trk.tid, self.next_tid = self.next_tid, self.next_tid + 1
             if trk.confirmed and trk.tid is not None and trk.avg_score >= self.cfg.out_score_thr:
@@ -185,8 +277,8 @@ class OnlineTracker:
                     (trk.tid, trk.voted_cls, score, _clamp_box(list(box), w_px, h_px))
                 )
 
-        for i in rest_t2:
-            rest_tracks[i].misses += 1
+        for i in rest_t3:
+            occ_tracks[i].misses += 1
 
         for j in rest_high:
             cid, score, box = high[j]
@@ -204,6 +296,7 @@ class OnlineTracker:
                 avg_score=score,
                 last_det_frame=self.frame_idx,
                 last_det_box=list(box),
+                cmc_last_box=list(box),
             )
             trk.class_votes[cid] += score
             self.tracks.append(trk)
@@ -369,10 +462,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--web", action="store_true", help="Stream live preview to browser (auto if OpenCV is headless)")
     p.add_argument("--port", type=int, default=8766, help="Port for --web live MJPEG preview")
     p.add_argument("--loop", action="store_true", help="Loop video file continuously for live viewing")
-    p.add_argument("--no-crops", action="store_true", help="Disable zoomed 192px ROI crops")
+    p.add_argument("--no-crops", action="store_true", help="Disable zoomed ROI crops")
+    p.add_argument("--min-crop-side", type=int, default=192, help="Min crop side in px (< 384 enables upscaling)")
+    p.add_argument("--discover", action="store_true", help="Enable round-robin idle tile discovery for tiny drones")
+    p.add_argument("--discover-tile-side", type=int, default=256, help="Tile side (px) for --discover")
+    p.add_argument("--discover-budget-idle", type=int, default=6, help="Discovery tiles/frame while idle")
+    p.add_argument("--discover-score-thr", type=float, default=0.45, help="Score threshold on discovery tiles")
     p.add_argument("--no-cmc", action="store_true", help="Disable camera motion compensation")
     p.add_argument("--high-thr", type=float, default=0.40)
     p.add_argument("--out-score-thr", type=float, default=0.40)
+    p.add_argument("--max-age", type=int, default=45, help="Frames to keep track ID alive during occlusion")
     p.add_argument("--max-frames", type=int, default=0, help="Stop after N frames (0 = full video)")
     p.add_argument("--max-display-height", type=int, default=900, help="Scale preview window if taller")
     return p.parse_args()
@@ -383,9 +482,14 @@ def main() -> None:
     cfg = Config(
         high_thr=args.high_thr,
         out_score_thr=args.out_score_thr,
+        max_age=args.max_age,
         use_crops=not args.no_crops,
+        min_crop_side=args.min_crop_side,
         use_cmc=not args.no_cmc,
-        use_discover=False,
+        use_discover=args.discover,
+        discover_tile_side=args.discover_tile_side,
+        discover_budget_idle=args.discover_budget_idle,
+        discover_score_thr=args.discover_score_thr,
     )
 
     if args.weights is not None:

@@ -1,19 +1,42 @@
-calibration
-dataset
-dataset_aug
+# Datasets & raw media
+calibration/
+dataset/
+dataset_*/
 dataset_card.json
-tracking_eval
+tracking_eval/
+nos_videos/
 
-# Generated artifacts (training, exports, predictions, Python build)
-__pycache__/
-*.egg-info/
-.venv/
+# Generated artifacts (training, exports, predictions, videos)
 *.onnx
+*.onnx.data
 *.pth
+*.pt
 *.ckpt
+*.safetensors
+*.mp4
+*.avi
+*.mov
 starter-kit/runs/
 starter-kit/exports/
 starter-kit/pred_mot*/
 starter-kit/*preds*.json
 Kalman/runs/
 
+# Python / virtualenv / build
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
