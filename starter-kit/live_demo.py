@@ -30,8 +30,10 @@ Examples (from starter-kit/):
 from __future__ import annotations
 
 import argparse
+import threading
 import time
 from collections import defaultdict, deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -273,6 +275,88 @@ def _draw_overlay(
     return vis
 
 
+class _MjpegServer:
+    """Zero-dependency live MJPEG preview server (fallback when OpenCV is headless)."""
+
+    def __init__(self, port: int = 8766) -> None:
+        self.port = port
+        self._cond = threading.Condition()
+        self._jpeg: bytes | None = None
+        self._stopped = False
+        parent = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return
+
+            def do_GET(self) -> None:
+                if self.path in ("/", "/index.html"):
+                    html = (
+                        b"<!doctype html><html><body style='margin:0;background:#111;"
+                        b"display:flex;justify-content:center;align-items:center;height:100vh'>"
+                        b"<img src='/stream.mjpg' style='max-width:100%;max-height:100vh'/>"
+                        b"</body></html>"
+                    )
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(html)))
+                    self.end_headers()
+                    self.wfile.write(html)
+                    return
+                if self.path != "/stream.mjpg":
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header(
+                    "Content-Type", "multipart/x-mixed-replace; boundary=frame"
+                )
+                self.end_headers()
+                try:
+                    while not parent._stopped:
+                        with parent._cond:
+                            parent._cond.wait(timeout=0.5)
+                            jpg = parent._jpeg
+                        if jpg is None:
+                            continue
+                        self.wfile.write(
+                            b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                            + str(len(jpg)).encode()
+                            + b"\r\n\r\n"
+                            + jpg
+                            + b"\r\n"
+                        )
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        self._httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+
+    def push(self, bgr: np.ndarray) -> None:
+        ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 82])
+        if ok:
+            with self._cond:
+                self._jpeg = buf.tobytes()
+                self._cond.notify_all()
+
+    def close(self) -> None:
+        self._stopped = True
+        with self._cond:
+            self._cond.notify_all()
+        self._httpd.shutdown()
+        self._httpd.server_close()
+
+
+def _has_cv2_gui() -> bool:
+    try:
+        cv2.namedWindow("__probe__", cv2.WINDOW_NORMAL)
+        cv2.destroyWindow("__probe__")
+        return True
+    except cv2.error:
+        return False
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -281,7 +365,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weights", type=Path, default=None, help="PyTorch .pth checkpoint (runs on CUDA GPU)")
     p.add_argument("--onnx", type=Path, default=None, help="Static ONNX model (runs on CPU ORT)")
     p.add_argument("--save", type=Path, default=None, help="Optional output annotated MP4 path")
-    p.add_argument("--no-display", action="store_true", help="Disable OpenCV GUI window (headless)")
+    p.add_argument("--no-display", action="store_true", help="Disable live preview completely")
+    p.add_argument("--web", action="store_true", help="Stream live preview to browser (auto if OpenCV is headless)")
+    p.add_argument("--port", type=int, default=8766, help="Port for --web live MJPEG preview")
+    p.add_argument("--loop", action="store_true", help="Loop video file continuously for live viewing")
     p.add_argument("--no-crops", action="store_true", help="Disable zoomed 192px ROI crops")
     p.add_argument("--no-cmc", action="store_true", help="Disable camera motion compensation")
     p.add_argument("--high-thr", type=float, default=0.40)
@@ -324,6 +411,19 @@ def main() -> None:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(str(args.save), fourcc, fps_in, (w_in, h_in))
 
+    use_gui = False
+    web_server: _MjpegServer | None = None
+    if not args.no_display:
+        if not args.web and _has_cv2_gui():
+            use_gui = True
+        else:
+            web_server = _MjpegServer(port=args.port)
+            print(
+                f"OpenCV headless detected (or --web set) -> Live stream ready at "
+                f"http://127.0.0.1:{args.port}  (Ctrl+C to stop)",
+                flush=True,
+            )
+
     tracker = OnlineTracker(detector, cfg)
     trails: dict[int, deque[tuple[int, int]]] = defaultdict(lambda: deque(maxlen=30))
     fps_ema = 0.0
@@ -333,6 +433,11 @@ def main() -> None:
         while True:
             ok, bgr = cap.read()
             if not ok:
+                if args.loop and isinstance(src, str):
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    tracker = OnlineTracker(detector, cfg)
+                    trails.clear()
+                    continue
                 break
             t0 = time.perf_counter()
             tracks_out, regions, n_pass = tracker.step(bgr)
@@ -345,7 +450,7 @@ def main() -> None:
             if writer is not None:
                 writer.write(vis)
 
-            if not args.no_display:
+            if use_gui:
                 disp = vis
                 if disp.shape[0] > args.max_display_height:
                     scale = args.max_display_height / disp.shape[0]
@@ -353,15 +458,24 @@ def main() -> None:
                 cv2.imshow("C-UAS Live Tracking (q to quit)", disp)
                 if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
                     break
+            elif web_server is not None:
+                web_server.push(vis)
 
             if args.max_frames > 0 and tracker.frame_idx >= args.max_frames:
                 break
+    except KeyboardInterrupt:
+        pass
     finally:
         cap.release()
         if writer is not None:
             writer.release()
-        if not args.no_display:
-            cv2.destroyAllWindows()
+        if web_server is not None:
+            web_server.close()
+        if use_gui:
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
 
     if frame_times:
         med_ms = float(np.median(frame_times))
