@@ -40,3 +40,11 @@ Thumbs.db
 *.swp
 *.swo
 *~
+tracking_eval
+.venv
+metrics.csv
+*.onnx
+*.pth
+*.ckpt
+*.egg-info/
+__pycache__/
